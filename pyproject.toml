@@ -23,6 +23,8 @@ dependencies = [
     "pyodbc",                 # MSSQL
     "cx_Oracle",              # Oracle
     "pwinput",
+    "pandas",
+    "openpyxl",
 ]
 
 [project.scripts]

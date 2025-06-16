@@ -8,6 +8,10 @@
 
 import sys
 from pathlib import Path
+import os
+import sqlite3
+import tempfile
+import pandas as pd
 
 # Add the src directory to the Python path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -16,6 +20,7 @@ import argparse
 import logging
 import re
 import traceback
+import shlex
 from getpass import getpass
 from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass
@@ -122,7 +127,8 @@ SHOW_TRACEBACKS = False
 USER_MANUAL = """
 Transqlate converts natural language questions into executable SQL using a
 fine‑tuned Phi‑4 Mini model. It works with SQLite, PostgreSQL, MySQL,
-MSSQL and Oracle databases.
+MSSQL and Oracle databases. You can also work with Excel or CSV files by
+loading them as a temporary SQLite database.
 
 Overview
 --------
@@ -141,6 +147,7 @@ REPL Commands
 :run         re‑run last SQL
 :edit        edit last SQL before running
 :write       manually enter SQL
+:export      save table or query results to CSV/Excel (spreadsheet mode)
 :examples    sample natural language prompts
 :clear       clear the screen
 :changedb    connect to a new database (alias :change_db)
@@ -379,6 +386,45 @@ def _choose_db_interactively(spinner: Optional[_Spinner] = None) -> Tuple[str, d
     )
     return _collect_db_params(db_type)
 
+
+def _choose_mode() -> str:
+    """Prompt the user to pick Database or Spreadsheet mode."""
+    global _GLOBAL_SPINNER
+    if _GLOBAL_SPINNER:
+        _GLOBAL_SPINNER.stop()
+        _GLOBAL_SPINNER = None
+    console.print(
+        "Select mode:\n[1] Database (connect to SQLite, Postgres, etc.)\n[2] Spreadsheet/CSV (work with Excel or CSV files)"
+    )
+    return Prompt.ask("Enter choice", choices=["1", "2"], default="1")
+
+
+def _spreadsheet_to_sqlite(path: str) -> Tuple[str, str]:
+    """Load a spreadsheet/CSV into a temp SQLite DB and return the path and table name."""
+    p = Path(path).expanduser()
+    ext = p.suffix.lower()
+    if ext not in {".csv", ".xlsx", ".xls"}:
+        raise ValueError("File must be .csv, .xlsx or .xls")
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+    if ext == ".csv":
+        df = pd.read_csv(p)
+        sheet = p.stem
+    else:
+        xl = pd.ExcelFile(p)
+        if len(xl.sheet_names) > 1:
+            console.print(f"Multiple sheets detected: {', '.join(xl.sheet_names)}")
+            sheet = Prompt.ask("Enter the name of the sheet you want to use", choices=xl.sheet_names, default=xl.sheet_names[0])
+        else:
+            sheet = xl.sheet_names[0]
+        df = pd.read_excel(xl, sheet_name=sheet)
+    fd, temp_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    conn = sqlite3.connect(temp_path)
+    df.to_sql(sheet, conn, if_exists="replace", index=False)
+    conn.close()
+    return temp_path, sheet
+
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
@@ -451,6 +497,9 @@ class Session:
         inference: NL2SQLInference,
         table_embs=None,
         connection_params: Optional[dict] = None,
+        *,
+        spreadsheet_mode: bool = False,
+        temp_db_path: Optional[str] = None,
     ):
         self.db_type = db_type
         self.extractor = extractor
@@ -461,6 +510,8 @@ class Session:
         self.history: List[HistoryEntry] = []
         self.table_embs = table_embs
         self.connection_params = connection_params or {}
+        self.spreadsheet_mode = spreadsheet_mode
+        self.temp_db_path = temp_db_path
         engine = db_type.lower()
         if engine in ("mssql", "sqlserver"):
             default_schema = "dbo"
@@ -544,7 +595,7 @@ class Session:
         if self.db_type.lower() in ("mssql", "sqlserver", "postgres", "postgresql", "oracle"):
             sql = self._qualify_tables(sql)
         # -- DDL/DML confirmation prompt --
-        if self.DDL_DML_PATTERN.match(sql):
+        if self.DDL_DML_PATTERN.match(sql) and not self.spreadsheet_mode:
             console.print(Panel(
                 f"[red]Caution: This statement will alter your database.[/red]\n"
                 f"[bold yellow]{sql}[/bold yellow]",
@@ -678,56 +729,91 @@ class Session:
             s for s, _ in fuzz_process.extract(token, candidates, limit=top_k)
         ]
 
+    def close(self) -> None:
+        try:
+            self.extractor.close()
+        except Exception:
+            pass
+        if self.temp_db_path:
+            try:
+                os.unlink(self.temp_db_path)
+            except Exception:
+                pass
+
 def _build_session(args) -> Optional[Session]:
     interactive_ok = sys.stdin.isatty()
     attempts = 0
-    while True:
-        if args.db_type and attempts == 0:
-            db_type = args.db_type.lower()
-            params = {
-                k: v
-                for k, v in {
-                    "db_path": args.db_path,
-                    "host": args.host,
-                    "port": args.port,
-                    "dbname": args.database,
-                    "database": args.database,
-                    "user": args.user,
-                    "password": args.password,
-                }.items()
-                if v is not None
-            }
-        else:
-            db_type, params = _choose_db_interactively(_GLOBAL_SPINNER)
-        try:
-            with console.status("[bold cyan]Connecting to database...[/bold cyan]", spinner="dots"):
-                extractor = get_schema_extractor(db_type, **params)
-                schema_dict = extractor.extract_schema()
-            console.print(f"[green]✓ Connected to {db_type} database.[/green]")
-            break
-        except Exception as e:
-            console.print(
-                Panel(
-                    f"Could not connect: {e}\n[dim]Check your host, port, username, password, or database name.[/dim]",
-                    style="red",
+    spreadsheet_mode = False
+    temp_db = None
+    mode = "1"
+    if interactive_ok:
+        mode = _choose_mode()
+    if mode == "2":
+        while True:
+            path = Prompt.ask("Enter path to your spreadsheet file (.csv, .xlsx, .xls):")
+            try:
+                temp_db, _ = _spreadsheet_to_sqlite(path)
+                db_type = "sqlite"
+                params = {"db_path": temp_db}
+                spreadsheet_mode = True
+                break
+            except Exception as e:
+                console.print(f"[red]Failed to load spreadsheet: {e}[/red]")
+                if not interactive_ok:
+                    return None
+    else:
+        while True:
+            if args.db_type and attempts == 0:
+                db_type = args.db_type.lower()
+                params = {
+                    k: v
+                    for k, v in {
+                        "db_path": args.db_path,
+                        "host": args.host,
+                        "port": args.port,
+                        "dbname": args.database,
+                        "database": args.database,
+                        "user": args.user,
+                        "password": args.password,
+                    }.items()
+                    if v is not None
+                }
+            else:
+                db_type, params = _choose_db_interactively(_GLOBAL_SPINNER)
+            try:
+                with console.status("[bold cyan]Connecting to database...[/bold cyan]", spinner="dots"):
+                    extractor = get_schema_extractor(db_type, **params)
+                    schema_dict = extractor.extract_schema()
+                console.print(f"[green]✓ Connected to {db_type} database.[/green]")
+                break
+            except Exception as e:
+                console.print(
+                    Panel(
+                        f"Could not connect: {e}\n[dim]Check your host, port, username, password, or database name.[/dim]",
+                        style="red",
+                    )
                 )
-            )
-            if not interactive_ok:
-                return None
-            retry = Prompt.ask(
-                "Retry connection? (y/N/troubleshoot)", default="N"
-            )
-            resp = retry.strip().lower().lstrip(":")
-            if resp == "troubleshoot":
-                _print_troubleshooting(db_type)
+                if not interactive_ok:
+                    return None
+                retry = Prompt.ask(
+                    "Retry connection? (y/N/troubleshoot)", default="N"
+                )
+                resp = retry.strip().lower().lstrip(":")
+                if resp == "troubleshoot":
+                    _print_troubleshooting(db_type)
+                    args.db_type = None
+                    attempts += 1
+                    continue
+                if resp not in {"y", "yes"}:
+                    return None
                 args.db_type = None
                 attempts += 1
                 continue
-            if resp not in {"y", "yes"}:
-                return None
-            args.db_type = None
-            attempts += 1
-            continue
+    if mode == "2":
+        with console.status("[bold cyan]Loading spreadsheet...[/bold cyan]", spinner="dots"):
+            extractor = get_schema_extractor("sqlite", db_path=temp_db)
+            schema_dict = extractor.extract_schema()
+        console.print("[green]✓ Spreadsheet loaded.[/green]")
     model_id = args.model or "Shaurya-Sethi/transqlate-phi4"
     model_id = model_id.replace("\\", "/")
 
@@ -767,6 +853,8 @@ def _build_session(args) -> Optional[Session]:
         inference,
         table_embs,
         connection_params=params,
+        spreadsheet_mode=spreadsheet_mode,
+        temp_db_path=temp_db,
     )
 
 def find_sublist_indices(lst, sublst):
@@ -939,6 +1027,7 @@ def repl(session: Session, run_sql: bool, max_new_tokens: int):
                     ":edit – edit last SQL before running\n"
                     ":write – manually enter a SQL query\n"
                     ":examples – sample NL prompts\n"
+                    ":export – save a table or query result to CSV/Excel (spreadsheet mode)\n"
                     ":clear – clear screen\n"
                     ":changedb – switch to a new database connection\n"
                     ":about – detailed documentation and user manual for this tool\n"
@@ -987,6 +1076,30 @@ def repl(session: Session, run_sql: bool, max_new_tokens: int):
                 else:
                     session.add_history("", manual_sql, user_written=True)
                     console.print("[green]Manual SQL entry added. Use :run to execute.[/green]")
+            elif cmd == "export":
+                if not session.spreadsheet_mode:
+                    console.print("[red]:export is only available in Spreadsheet mode.[/red]")
+                else:
+                    parts = shlex.split(" ".join(rest))
+                    if len(parts) < 3:
+                        console.print("Usage: :export [csv|excel] <table or SQL query> <filename>")
+                    else:
+                        fmt = parts[0].lower()
+                        expr = parts[1]
+                        filename = parts[2]
+                        if fmt not in {"csv", "excel"}:
+                            console.print("[red]Format must be 'csv' or 'excel'.[/red]")
+                        else:
+                            sql = expr if expr.lower().startswith("select") else f'SELECT * FROM "{expr}"'
+                            try:
+                                df = pd.read_sql_query(sql, session.extractor.conn)
+                                if fmt == "csv":
+                                    df.to_csv(filename, index=False)
+                                else:
+                                    df.to_excel(filename, index=False)
+                                console.print(f"[green]✓ Exported to {filename}[/green]")
+                            except Exception as e:
+                                _print_exception(e)
             elif cmd == "examples":
                 console.print(
                     "- Show me total sales by month in 2023\n"
@@ -1114,6 +1227,7 @@ def main():
             execute=args.execute,
             max_new_tokens=args.max_new_tokens,
         )
+    session.close()
 
 if __name__ == "__main__":
     main()

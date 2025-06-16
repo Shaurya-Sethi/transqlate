@@ -35,6 +35,7 @@ Transqlate is designed for seamless, safe, and accurate English-to-SQL translati
 * **Chain-of-Thought Reasoning**: Produces both reasoning steps and final SQL for transparency and error analysis.
 * **Safe Execution Guardrails**: Confirms user intent before running any query that alters data or schema; all data-altering commands require explicit approval.
 * **Interactive CLI**: Supports live query, schema browsing, command history, dynamic DB switching, and error-tolerant UX.
+* **Spreadsheet/CSV Mode**: Load Excel or CSV files as a temporary SQLite database and export results back to spreadsheets.
 * **Automatic Dialect Conversion**: Generated SQLite-style SQL is converted to PostgreSQL, MySQL, SQL Server, or Oracle syntax before execution.
 * **Cloud-Scale Fine-Tuning**: All model training conducted on GCP with Unsloth’s QLoRA for memory- and compute-efficient LLM fine-tuning.
 * **Modern Packaging**: Distributed as a pip-installable Python package with a single CLI entry point.
@@ -101,6 +102,12 @@ The CLI tool, installed via pip, allows you to interactively generate, review, a
 pip install transqlate
 ```
 
+For spreadsheet mode you will also need `pandas` and `openpyxl`:
+
+```bash
+pip install pandas openpyxl
+```
+
 ### **Usage**
 
 Start the interactive CLI:
@@ -134,6 +141,7 @@ transqlate -q "Which customers made purchases in March?" --db-path path/to/your.
 * Automatic SQL dialect fixes for Postgres, MySQL, SQL Server and Oracle
 * Automatic schema qualification for SQL Server, Oracle and PostgreSQL when tables live outside their default schemas
 * Command history, example prompts, and connection switching
+* Spreadsheet mode with `:export` command to save query results
 
 #### Schema Qualification Examples
 
